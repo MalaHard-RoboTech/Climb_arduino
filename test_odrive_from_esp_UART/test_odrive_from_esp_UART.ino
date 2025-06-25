@@ -1,6 +1,6 @@
 #include <ODriveUART.h>
 #include <HardwareSerial.h>
-
+//Change to HW serial in order to communicate with ESP32
 ////////////////////////////////
 // Set up serial pins to the ODrive
 ////////////////////////////////
