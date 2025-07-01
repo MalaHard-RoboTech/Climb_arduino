@@ -10,15 +10,18 @@ typedef struct struct_message {
 
 class DongleController {
 public:
-  DongleController(const uint8_t* peer_mac);
+  DongleController(const uint8_t* mac_dx, const uint8_t* mac_sx);
   void begin();
   void handleSerialInput();
 
 private:
   struct_message sendMsg;
   struct_message recvMsg;
-  esp_now_peer_info_t peerInfo;
-  uint8_t peerMac[6];
+  esp_now_peer_info_t peerInfoDx;
+  esp_now_peer_info_t peerInfoSx;
+
+  uint8_t macDx[6];
+  uint8_t macSx[6];
 
   static DongleController* instance;
   static void onDataSentStatic(const uint8_t *mac_addr, esp_now_send_status_t status);
@@ -26,5 +29,6 @@ private:
 
   void onDataSent(const uint8_t *mac_addr, esp_now_send_status_t status);
   void onDataRecv(const uint8_t *mac, const uint8_t *incomingData, int len);
-  void sendCommand(const char* cmd);
+  void sendCommandToDX(const char* cmd);
+  void sendCommandToSX(const char* cmd);
 };

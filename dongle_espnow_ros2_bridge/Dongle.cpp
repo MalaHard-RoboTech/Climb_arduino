@@ -2,8 +2,9 @@
 
 DongleController* DongleController::instance = nullptr;
 
-DongleController::DongleController(const uint8_t* peer_mac) {
-  memcpy(peerMac, peer_mac, 6);
+DongleController::DongleController(const uint8_t* mac_dx, const uint8_t* mac_sx) {
+  memcpy(macDx, mac_dx, 6);
+  memcpy(macSx, mac_sx, 6);
   instance = this;
 }
 
@@ -12,24 +13,28 @@ void DongleController::begin() {
   WiFi.disconnect();
 
   if (esp_now_init() != ESP_OK) {
-    Serial.println("❌ Errore inizializzazione ESP-NOW");
+    Serial.println("❌ ESP-NOW init failed");
     return;
   }
 
   esp_now_register_send_cb(onDataSentStatic);
   esp_now_register_recv_cb(onDataRecvStatic);
 
-  memcpy(peerInfo.peer_addr, peerMac, 6);
-  peerInfo.channel = 0;
-  peerInfo.encrypt = false;
+  // Add DX peer
+  memcpy(peerInfoDx.peer_addr, macDx, 6);
+  peerInfoDx.channel = 0;
+  peerInfoDx.encrypt = false;
+  esp_now_add_peer(&peerInfoDx);
 
-  if (esp_now_add_peer(&peerInfo) != ESP_OK) {
-    Serial.println("❌ Errore nell'aggiunta peer");
-  }
+  // Add SX peer
+  memcpy(peerInfoSx.peer_addr, macSx, 6);
+  peerInfoSx.channel = 0;
+  peerInfoSx.encrypt = false;
+  esp_now_add_peer(&peerInfoSx);
 
-  Serial.print("🔧 MAC dongle: ");
+  Serial.print("🔧 Dongle MAC: ");
   Serial.println(WiFi.macAddress());
-  Serial.println("✅ Pronto. Digita un comando nella seriale.");
+  Serial.println("✅ Type 'dx:<cmd>' or 'sx:<cmd>' to send commands.");
 }
 
 void DongleController::handleSerialInput() {
@@ -38,29 +43,40 @@ void DongleController::handleSerialInput() {
   String input = Serial.readStringUntil('\n');
   input.trim();
 
-  if (
-    input == "on" || input == "off" || input == "stop" ||
-    input == "idle" || input == "closed_loop" ||
-    input.startsWith("torque:") ||
-    input.startsWith("vel:") ||
-    input.startsWith("pos:")
-  ) {
-    sendCommand(input.c_str());
+  if (input.startsWith("dx:")) {
+    String cmd = input.substring(3);
+    sendCommandToDX(cmd.c_str());
+  } else if (input.startsWith("sx:")) {
+    String cmd = input.substring(3);
+    sendCommandToSX(cmd.c_str());
   } else {
-    Serial.println("⚠️ Comando non valido. Usa 'on', 'off', 'stop', 'idle', 'closed_loop', 'torque:x', 'vel:x', 'pos:x'.");
+    Serial.println("⚠️ Invalid. Use 'dx:<cmd>' or 'sx:<cmd>' only.");
   }
 }
 
-void DongleController::sendCommand(const char* cmd) {
+void DongleController::sendCommandToDX(const char* cmd) {
   strncpy(sendMsg.text, cmd, MAX_TEXT_LENGTH);
   sendMsg.text[MAX_TEXT_LENGTH - 1] = '\0';
 
-  Serial.print("📤 Inviando comando all'Arganello: ");
+  Serial.print("📤 → DX: ");
   Serial.println(sendMsg.text);
 
-  esp_err_t result = esp_now_send(peerMac, (uint8_t*)&sendMsg, sizeof(sendMsg));
+  esp_err_t result = esp_now_send(macDx, (uint8_t*)&sendMsg, sizeof(sendMsg));
   if (result != ESP_OK) {
-    Serial.println("❌ Errore durante l'invio");
+    Serial.println("❌ Failed to send to DX");
+  }
+}
+
+void DongleController::sendCommandToSX(const char* cmd) {
+  strncpy(sendMsg.text, cmd, MAX_TEXT_LENGTH);
+  sendMsg.text[MAX_TEXT_LENGTH - 1] = '\0';
+
+  Serial.print("📤 → SX: ");
+  Serial.println(sendMsg.text);
+
+  esp_err_t result = esp_now_send(macSx, (uint8_t*)&sendMsg, sizeof(sendMsg));
+  if (result != ESP_OK) {
+    Serial.println("❌ Failed to send to SX");
   }
 }
 
@@ -74,12 +90,22 @@ void DongleController::onDataRecvStatic(const uint8_t *mac, const uint8_t *incom
 
 void DongleController::onDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
   Serial.print("📤 Stato invio: ");
-  Serial.println(status == ESP_NOW_SEND_SUCCESS ? "✅ Riuscito" : "❌ Fallito");
+  Serial.println(status == ESP_NOW_SEND_SUCCESS ? "✅ OK" : "❌ Failed");
 }
 
 void DongleController::onDataRecv(const uint8_t *mac, const uint8_t *incomingData, int len) {
   memcpy(&recvMsg, incomingData, sizeof(recvMsg));
-  Serial.print("📨 Risposta da Arganello [");
+
+  const char* sender = "❓ Unknown";
+  if (memcmp(mac, macDx, 6) == 0) {
+    sender = "📟 Arganello DX";
+  } else if (memcmp(mac, macSx, 6) == 0) {
+    sender = "📟 Arganello SX";
+  }
+
+  Serial.print("📨 From ");
+  Serial.print(sender);
+  Serial.print(" [");
   for (int i = 0; i < 6; i++) {
     Serial.printf("%02X", mac[i]);
     if (i < 5) Serial.print(":");
