@@ -46,6 +46,19 @@ void handleCommand(const char* cmd) {
         return;
     }
 
+    if (strcmp(cmd, "idle") == 0) {
+        odrive.setState(AXIS_STATE_IDLE);
+        Serial.println("🟡 ODrive set to IDLE");
+        return;
+    }
+
+    if (strcmp(cmd, "closed_loop") == 0) {
+        odrive.clearErrors();  // optional
+        odrive.setState(AXIS_STATE_CLOSED_LOOP_CONTROL);
+        Serial.println("🟢 ODrive set to CLOSED_LOOP_CONTROL");
+        return;
+    }
+
     // Stop all motion
     if (strcmp(cmd, "stop") == 0) {
         odrive.setVelocity(0);
@@ -140,12 +153,12 @@ void loop() {
     if (now - lastPrint >= LOWPRIO_INTERVAL_MS) {
         lastPrint = now;
 
-        // Fetch ODrive feedback
         ODriveFeedback feedback = odrive.getFeedback();
         float voltage = odrive.getParameterAsFloat("vbus_voltage");
         float temperature = odrive.getParameterAsFloat("axis0.fet_thermistor.temperature");
         float current = odrive.getParameterAsFloat("axis0.motor.current_control.Iq_measured");
 
+        // Serial output for local debugging
         Serial.println("🔽 Low-priority stats:");
         Serial.printf("🔄 Count: %ld\n", count);
         Serial.printf("📍 Position: %.2f turns\n", feedback.pos);
@@ -154,6 +167,25 @@ void loop() {
         Serial.printf("🌡️ Temp: %.2f °C\n", temperature);
         Serial.printf("⚡ Current: %.2f A\n", current);
         Serial.println();
+
+        // Send each stat separately via ESP-NOW
+        char msg[64];
+
+        snprintf(msg, sizeof(msg), "POS: %.2f", feedback.pos);
+        espnow.sendMessage(msg);
+
+        snprintf(msg, sizeof(msg), "VEL: %.2f", feedback.vel);
+        espnow.sendMessage(msg);
+
+        snprintf(msg, sizeof(msg), "VOLTAGE: %.2f", voltage);
+        espnow.sendMessage(msg);
+
+        snprintf(msg, sizeof(msg), "TEMP: %.2f", temperature);
+        espnow.sendMessage(msg);
+
+        snprintf(msg, sizeof(msg), "CURRENT: %.2f", current);
+        espnow.sendMessage(msg);
     }
+
 }
 
