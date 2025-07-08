@@ -12,8 +12,6 @@ odrv0.axis0.controller.enable_torque_mode_vel_limit = False
 #do enable external forces discrepany 
 odrv0.axis0.controller.config.spinout_electrical_power_treshold = 30
 odrv0.axis0.controller.config.spinout_mechanical_power_treshold = -30
-
-odrv0.config.dc_bus_overvoltage_trip_level = 50
 odrv0.config.dc_max_positive_current = 15
 
 odrv0.Config.dc_bus_undervoltage_trip_level = 30
