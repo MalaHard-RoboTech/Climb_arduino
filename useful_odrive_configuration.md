@@ -1,6 +1,7 @@
 ## handy refence 
 https://docs.odriverobotics.com/v/latest/manual/control.html#torque-control
 
+# put odrive uart at 921600 for 200hz commands
 
 #calibrate with the motor detached!
 #also be in passthough mode for raw behaviour!
@@ -20,4 +21,4 @@ odrv0.Config.dc_bus_undervoltage_trip_level = 30
 
 odrv0.config.max_regen_current = 0.1
 
-## to make the regerative current circuit work i had to disable otp (over temp protection) switch -> off because we don't have a thermistor yet but we can add one in the near future
+# to make the regerative current circuit work i had to disable otp (over temp protection) switch -> off because we don't have a thermistor jet but we can add one in the near future
