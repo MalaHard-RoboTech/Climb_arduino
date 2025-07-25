@@ -1,7 +1,6 @@
 #include "Encoder.h"
 #include "Brake.h"
-#include "Motor.h"
-#include "Message.h"
+#include <ODriveUART.h>
 
 #define ODRIVE_RX 17
 #define ODRIVE_TX 16
@@ -12,66 +11,109 @@
 Encoder encoder(ENCODER_A, ENCODER_B);
 Brake brake(RELAY_PIN);
 
-HardwareSerial odrive_serial(1); // Use UART1
-Motor motor(odrive_serial, 17, 16); // RX = 16 (ODrive TX), TX = 17 (ODrive RX)
+HardwareSerial& odrive_serial = Serial1;  // UART1
+ODriveUART odrive(odrive_serial);
 
-MessageIn messageIn;
-MessageOut messageOut;
+String inputBuffer;
 
 void setup() {
     Serial.begin(115200);
+    odrive_serial.begin(921600, SERIAL_8N1, ODRIVE_RX, ODRIVE_TX);
+
     brake.begin();
     encoder.begin();
-    motor.begin();
 
     Serial.println("✅ Arganello ready");
 }
 
 void loop() {
-    // ─────────────────────────────────────────────────────
-    // 1. Read command from PC
-    // ─────────────────────────────────────────────────────
-    if (Serial.available() >= sizeof(MessageIn)) {
-        Serial.readBytes((uint8_t*)&messageIn, sizeof(MessageIn));
+    // For testing: continuously show encoder velocity every 100ms
+    static unsigned long lastPrint = 0;
+    unsigned long now = millis();
 
-        brake.setBrakeEngaged(messageIn.brake_command);
-
-        switch (messageIn.motor_mode) {
-            case 0: motor.setIdle(); break;
-            case 1: motor.setClosedLoop(); break;
-        }
-
-        //only called in when value actually changes
-        motor.setTorque(messageIn.target_torque);
-        motor.setVelocity(messageIn.target_velocity);
-        motor.setPosition(messageIn.target_position);
+    if (now - lastPrint >= 2) {
+        lastPrint = now;
+        handleCommand("get_encoder_velocity");
     }
 
-    // ─────────────────────────────────────────────────────
-    // 2. Send telemetry to PC
-    // ─────────────────────────────────────────────────────
-    static unsigned long lastSend = 0;
-    if (millis() - lastSend >= 5) {
-        lastSend = millis();
-
-        messageOut.brake_status = brake.isBrakeEngaged();
-        messageOut.motor_mode_status = messageIn.motor_mode;
-        messageOut.encoder_count = encoder.getCount();
-        messageOut.iq_current = motor.getIqCurrent();
-        messageOut.vbus_voltage = motor.getVbusVoltage();
-        messageOut.motor_temperature = motor.getMotorTemp();
-
-        // printTelemetry(messageOut);  // Uncomment for debug
-        Serial.write((uint8_t*)&messageOut, sizeof(MessageOut));
+    // Still allow manual commands via Serial if needed
+    while (Serial.available()) {
+        char c = Serial.read();
+        if (c == '\n') {
+            handleCommand(inputBuffer);
+            inputBuffer = "";
+        } else {
+            inputBuffer += c;
+        }
     }
 }
 
-void printTelemetry(const MessageOut& msg) {
-    Serial.println("📤 MessageOut:");
-    Serial.print("  Brake Status: ");       Serial.println(msg.brake_status ? "ENGAGED" : "RELEASED");
-    Serial.print("  Motor Mode: ");         Serial.println(msg.motor_mode_status == 1 ? "CLOSED_LOOP" : "IDLE");
-    Serial.print("  Encoder Count: ");      Serial.println(msg.encoder_count);
-    Serial.print("  Iq Current: ");         Serial.println(msg.iq_current, 3);
-    Serial.print("  VBus Voltage: ");       Serial.println(msg.vbus_voltage, 2);
-    Serial.print("  Motor Temp: ");         Serial.println(msg.motor_temperature, 1);
+
+void handleCommand(const String& cmd) {
+    if (cmd == "get_encoder_counts") {
+        Serial.println(encoder.getCount());
+    }
+    else if (cmd == "get_encoder_velocity") {
+        Serial.println(encoder.getVelocity(), 3);  // Print with 3 decimal places
+    }
+    else if (cmd == "get_brake_status") {
+        Serial.println(brake.isBrakeEngaged() ? "1" : "0");
+    }
+    else if (cmd.startsWith("set_brake ")) {
+        bool engage = cmd.endsWith("1");
+        brake.setBrakeEngaged(engage);
+        Serial.println("OK");
+    }
+    else if (cmd.startsWith("send_odrive ")) {
+        String line = cmd.substring(strlen("send_odrive "));  // Remove prefix
+
+        // Send raw passthrough command
+        if (line.startsWith("p ")) {
+            odrive_serial.println(line.substring(2));  // Directly print to UART
+            Serial.println("OK");
+            return;
+        }
+
+        // Parse "w axis0.param value"
+        int firstSpace = line.indexOf(' ');
+        int secondSpace = line.indexOf(' ', firstSpace + 1);
+
+        if (firstSpace < 0 || secondSpace < 0) {
+            Serial.println("ERR Invalid send_odrive format");
+            return;
+        }
+
+        String op = line.substring(0, firstSpace);
+        String path = line.substring(firstSpace + 1, secondSpace);
+        String value = line.substring(secondSpace + 1);
+
+        if (op == "w") {
+            odrive.setParameter(path, value);
+            Serial.println("OK");
+        } else {
+            Serial.println("ERR Unsupported op");
+        }
+    }
+    else if (cmd.startsWith("read_odrive ")) {
+        String line = cmd.substring(strlen("read_odrive "));  // Ex: "r axis0.encoder.vel_estimate"
+
+        int spacePos = line.indexOf(' ');
+        if (spacePos < 0) {
+            Serial.println("ERR Invalid read_odrive format");
+            return;
+        }
+
+        String op = line.substring(0, spacePos);
+        String path = line.substring(spacePos + 1);
+
+        if (op == "r") {
+            String result = odrive.getParameterAsString(path);
+            Serial.println(result);
+        } else {
+            Serial.println("ERR Unsupported op");
+        }
+    }
+    else {
+        Serial.println("ERR Unknown command");
+    }
 }
