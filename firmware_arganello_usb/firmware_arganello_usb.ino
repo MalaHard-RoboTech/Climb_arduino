@@ -17,7 +17,7 @@ ODriveUART odrive(odrive_serial);
 String inputBuffer;
 
 void setup() {
-    Serial.begin(115200);
+    Serial.begin(1000000);
     odrive_serial.begin(921600, SERIAL_8N1, ODRIVE_RX, ODRIVE_TX);
 
     brake.begin();
@@ -27,14 +27,7 @@ void setup() {
 }
 
 void loop() {
-    // For testing: continuously show encoder velocity every 100ms
-    static unsigned long lastPrint = 0;
-    unsigned long now = millis();
 
-    if (now - lastPrint >= 2) {
-        lastPrint = now;
-        handleCommand("get_encoder_velocity");
-    }
 
     // Still allow manual commands via Serial if needed
     while (Serial.available()) {
@@ -48,69 +41,62 @@ void loop() {
     }
 }
 
-
 void handleCommand(const String& cmd) {
-    if (cmd == "get_encoder_counts") {
-        Serial.println(encoder.getCount());
+    String trimmed = cmd;
+    trimmed.trim();  // Remove \r, \n, spaces
+
+    if (trimmed == "get_encoder_counts") {
+        Serial.println((int)encoder.getCount());  // Ensure integer
     }
-    else if (cmd == "get_encoder_velocity") {
-        Serial.println(encoder.getVelocity(), 3);  // Print with 3 decimal places
+    else if (trimmed == "get_encoder_velocity") {
+        Serial.println(encoder.getVelocity(), 3);
     }
-    else if (cmd == "get_brake_status") {
+    else if (trimmed == "get_brake_status") {
         Serial.println(brake.isBrakeEngaged() ? "1" : "0");
     }
-    else if (cmd.startsWith("set_brake ")) {
-        bool engage = cmd.endsWith("1");
-        brake.setBrakeEngaged(engage);
-        Serial.println("OK");
-    }
-    else if (cmd.startsWith("send_odrive ")) {
-        String line = cmd.substring(strlen("send_odrive "));  // Remove prefix
-
-        // Send raw passthrough command
-        if (line.startsWith("p ")) {
-            odrive_serial.println(line.substring(2));  // Directly print to UART
-            Serial.println("OK");
-            return;
-        }
-
-        // Parse "w axis0.param value"
-        int firstSpace = line.indexOf(' ');
-        int secondSpace = line.indexOf(' ', firstSpace + 1);
-
-        if (firstSpace < 0 || secondSpace < 0) {
-            Serial.println("ERR Invalid send_odrive format");
-            return;
-        }
-
-        String op = line.substring(0, firstSpace);
-        String path = line.substring(firstSpace + 1, secondSpace);
-        String value = line.substring(secondSpace + 1);
-
-        if (op == "w") {
-            odrive.setParameter(path, value);
+    else if (trimmed.startsWith("set_brake ")) {
+        char lastChar = trimmed.charAt(trimmed.length() - 1);
+        if (lastChar == '0' || lastChar == '1') {
+            brake.setBrakeEngaged(lastChar == '1');
             Serial.println("OK");
         } else {
-            Serial.println("ERR Unsupported op");
+            Serial.println("ERR Invalid brake value");
         }
     }
-    else if (cmd.startsWith("read_odrive ")) {
-        String line = cmd.substring(strlen("read_odrive "));  // Ex: "r axis0.encoder.vel_estimate"
+    else if (trimmed.startsWith("send_odrive ")) {
+        String rest = trimmed.substring(strlen("send_odrive "));
 
-        int spacePos = line.indexOf(' ');
-        if (spacePos < 0) {
-            Serial.println("ERR Invalid read_odrive format");
-            return;
+        if (rest.startsWith("p ")) {
+            odrive_serial.println(rest.substring(2));  // Passthrough
+            Serial.println("OK");
         }
+        else if (rest.startsWith("w ")) {
+            int firstSpace = rest.indexOf(' ');
+            int secondSpace = rest.indexOf(' ', firstSpace + 1);
 
-        String op = line.substring(0, spacePos);
-        String path = line.substring(spacePos + 1);
+            if (firstSpace < 0 || secondSpace < 0) {
+                Serial.println("ERR Invalid send_odrive format");
+                return;
+            }
 
-        if (op == "r") {
+            String path = rest.substring(firstSpace + 1, secondSpace);
+            String value = rest.substring(secondSpace + 1);
+
+            odrive.setParameter(path, value);
+            Serial.println("OK");
+        }
+        else {
+            Serial.println("ERR Unknown send_odrive op");
+        }
+    }
+    else if (trimmed.startsWith("read_odrive ")) {
+        String rest = trimmed.substring(strlen("read_odrive "));
+        if (rest.startsWith("r ")) {
+            String path = rest.substring(2);
             String result = odrive.getParameterAsString(path);
             Serial.println(result);
         } else {
-            Serial.println("ERR Unsupported op");
+            Serial.println("ERR Invalid read_odrive format");
         }
     }
     else {
