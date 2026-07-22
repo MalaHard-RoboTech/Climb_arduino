@@ -436,7 +436,7 @@ static constexpr float MZ_GAIN = 1.0f;
 // External/manual/high-level commands are expressed in newtons and converted
 // through forceToThrottle().
 static constexpr float PITCH_MIN_ACTIVE = 0.80f;  // 9.610 N on datasheet map
-static constexpr float YAW_MIN_ACTIVE   = 0.60f;  // 6.180 N on datasheet map
+static constexpr float YAW_MIN_ACTIVE   = 0.55f;  // 6.180 N on datasheet map
 
 static constexpr float PITCH_RAMP_STEP   = 0.10f;
 static constexpr float LATERAL_RAMP_STEP = 0.08f;
@@ -463,14 +463,14 @@ static float pitchPrevE        = 0.0f;
 volatile float yawRefRad       = 0.0f;
 volatile float yawKp           = 0.9f;
 volatile float yawKd           = 0.04f;
-volatile float yawUmax         = 0.60f; // 6.180 N on datasheet map
+volatile float yawUmax         = 0.70f; // 6.180 N on datasheet map
 volatile float yawDeadDeg      = 3.0f;
 
 // Yaw robusto contro drift lento IMU
 volatile float yawDeadOutExtraDeg = 8.0f;   // con ydb=10 parte sopra circa 18 deg
 
 
-static float yawPrevE             = 0.0f;
+static float yawPrevE          = 0.0f;
 
 static float lastPitchCmd      = 0.0f;
 static float lastYawCmd        = 0.0f;
