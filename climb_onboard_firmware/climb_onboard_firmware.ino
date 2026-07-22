@@ -36,8 +36,11 @@ Serial Commands
 - m<val>       → motor command in [-1..1], e.g. m-1, m0, m0.25, m1
 - mf <hz>      → set motor PWM to arbitrary frequency (e.g., "mf 200")
 - mstop        → stop motor (0 duty)
-- status       → print current angles, motor command, espnow tx count
-- help         → reprint help
+- THR,f1,...,f6 / t1..t6 → command per-EDF thrust in newtons (datasheet map)
+- PROP_COMMAND,f1,f2,f3,f4 → ROS/high-level per-EDF thrust in newtons (datasheet map)
+- umax/yumax <N>            → pitch/yaw maximum force per active EDF
+- status                    → print force, throttle, PWM and controller state
+- help                      → reprint help
 */
 
 #include <Arduino.h>
@@ -128,6 +131,116 @@ static constexpr uint32_t ESC_PWM_FREQ_HZ   = 50;
 static constexpr uint8_t  ESC_PWM_RES_BITS  = 14;
 static constexpr uint32_t ESC_PWM_PERIOD_US = 1000000UL / ESC_PWM_FREQ_HZ;
 
+static inline float clampf(float x, float a, float b) {
+  return x < a ? a : (x > b ? b : x);
+}
+
+// ── QX-MOTOR QF2611PRO 3100KV datasheet thrust map ──────────────────────────
+// Per-EDF catalogue map at 24 V. The 51 entries are obtained by piecewise-linear
+// interpolation between the manufacturer operating points:
+//   0.50 ->  4.810 N
+//   0.60 ->  6.180 N
+//   0.70 ->  7.350 N
+//   0.80 ->  9.610 N
+//   0.90 -> 11.870 N
+//   1.00 -> 14.030 N
+//
+// The table covers every command from 0.50 to 1.00 with a 0.01 increment.
+// 0 N means ESC stop (1000 us). A positive force request below 4.810 N is
+// raised to the first mapped point because the lower range is not characterised.
+static constexpr size_t THRUST_MAP_SIZE = 51;
+
+static constexpr float THRUST_COMMAND_MAP[THRUST_MAP_SIZE] = {
+  0.50f, 0.51f, 0.52f, 0.53f, 0.54f, 0.55f,
+  0.56f, 0.57f, 0.58f, 0.59f, 0.60f, 0.61f,
+  0.62f, 0.63f, 0.64f, 0.65f, 0.66f, 0.67f,
+  0.68f, 0.69f, 0.70f, 0.71f, 0.72f, 0.73f,
+  0.74f, 0.75f, 0.76f, 0.77f, 0.78f, 0.79f,
+  0.80f, 0.81f, 0.82f, 0.83f, 0.84f, 0.85f,
+  0.86f, 0.87f, 0.88f, 0.89f, 0.90f, 0.91f,
+  0.92f, 0.93f, 0.94f, 0.95f, 0.96f, 0.97f,
+  0.98f, 0.99f, 1.00f
+};
+
+static constexpr float THRUST_FORCE_MAP_N[THRUST_MAP_SIZE] = {
+  4.810f, 4.947f, 5.084f, 5.221f, 5.358f, 5.495f,
+  5.632f, 5.769f, 5.906f, 6.043f, 6.180f, 6.297f,
+  6.414f, 6.531f, 6.648f, 6.765f, 6.882f, 6.999f,
+  7.116f, 7.233f, 7.350f, 7.576f, 7.802f, 8.028f,
+  8.254f, 8.480f, 8.706f, 8.932f, 9.158f, 9.384f,
+  9.610f, 9.836f, 10.062f, 10.288f, 10.514f, 10.740f,
+  10.966f, 11.192f, 11.418f, 11.644f, 11.870f, 12.086f,
+  12.302f, 12.518f, 12.734f, 12.950f, 13.166f, 13.382f,
+  13.598f, 13.814f, 14.030f
+};
+
+static constexpr float THRUST_MIN_CHARACTERISED_N = 4.810f;
+static constexpr float THRUST_MAX_FORCE_N         = 14.030f;
+
+static_assert(THRUST_MAP_SIZE == 51, "Unexpected thrust-map size");
+
+static float forceToThrottle(float forceN) {
+  if (!isfinite(forceN) || forceN <= 0.0f) {
+    return 0.0f;
+  }
+
+  if (forceN <= THRUST_FORCE_MAP_N[0]) {
+    return THRUST_COMMAND_MAP[0];
+  }
+
+  if (forceN >= THRUST_FORCE_MAP_N[THRUST_MAP_SIZE - 1]) {
+    return THRUST_COMMAND_MAP[THRUST_MAP_SIZE - 1];
+  }
+
+  for (size_t i = 0; i + 1 < THRUST_MAP_SIZE; ++i) {
+    const float f0 = THRUST_FORCE_MAP_N[i];
+    const float f1 = THRUST_FORCE_MAP_N[i + 1];
+
+    if (forceN <= f1) {
+      const float d0 = THRUST_COMMAND_MAP[i];
+      const float d1 = THRUST_COMMAND_MAP[i + 1];
+      const float alpha = (forceN - f0) / (f1 - f0);
+      return d0 + alpha * (d1 - d0);
+    }
+  }
+
+  return 1.0f;
+}
+
+static float throttleToForce(float throttle) {
+  if (!isfinite(throttle) || throttle <= 0.0f) {
+    return 0.0f;
+  }
+
+  if (throttle < THRUST_COMMAND_MAP[0]) {
+    // Commands below 0.50 are outside the datasheet map.
+    // Return zero rather than inventing a calibrated force value.
+    return 0.0f;
+  }
+
+  if (throttle == THRUST_COMMAND_MAP[0]) {
+    return THRUST_FORCE_MAP_N[0];
+  }
+
+  if (throttle >= THRUST_COMMAND_MAP[THRUST_MAP_SIZE - 1]) {
+    return THRUST_FORCE_MAP_N[THRUST_MAP_SIZE - 1];
+  }
+
+  for (size_t i = 0; i + 1 < THRUST_MAP_SIZE; ++i) {
+    const float d0 = THRUST_COMMAND_MAP[i];
+    const float d1 = THRUST_COMMAND_MAP[i + 1];
+
+    if (throttle <= d1) {
+      const float f0 = THRUST_FORCE_MAP_N[i];
+      const float f1 = THRUST_FORCE_MAP_N[i + 1];
+      const float alpha = (throttle - d0) / (d1 - d0);
+      return f0 + alpha * (f1 - f0);
+    }
+  }
+
+  return THRUST_MAX_FORCE_N;
+}
+
 static inline uint32_t escUsToDuty(int us) {
   if (us < 0) us = 0;
   if (us > (int)ESC_PWM_PERIOD_US) us = ESC_PWM_PERIOD_US;
@@ -181,13 +294,22 @@ public:
     return attached_;
   }
 
+  // Low-level ESC command. Kept for the onboard PID, which still works
+  // internally with its original normalised output.
   void setThrottle(float x) {
+    if (!isfinite(x)) x = 0.0f;
     if (x < 0.0f) x = 0.0f;
     if (x > 1.0f) x = 1.0f;
 
     throttle_ = x;
     const int us = minUs_ + static_cast<int>((maxUs_ - minUs_) * throttle_);
     writeUs(us);
+  }
+
+  // Physical interface used by ROS/high-level and manual force commands.
+  // The lookup converts per-EDF thrust [N] to the normalised ESC command.
+  void setForceN(float forceN) {
+    setThrottle(forceToThrottle(forceN));
   }
 
   void stop() {
@@ -208,6 +330,7 @@ public:
   }
 
   float lastThrottle() const { return throttle_; }
+  float lastForceN() const { return throttle_ <= 0.0f ? 0.0f : throttleToForce(throttle_); }
   int lastPulseUs() const { return currentUs_; }
   uint8_t pin() const { return pin_; }
   uint8_t channel() const { return channel_; }
@@ -272,13 +395,28 @@ static constexpr uint32_t ESPNOW_STALE_MS = 1000;
 static constexpr uint32_t ESPNOW_FAIL_THRESHOLD = 5;
 
 
-volatile float cmdFx = 0.0f;   // body-frame force x request from high level
-volatile float cmdFy = 0.0f;   // body-frame force y request from high level
-volatile float cmdMz = 0.0f;   // open-loop yaw moment request from high level
+// Temporary force-bias convention used by WRC:
+//   cmdFx = per-active-EDF normal-axis force bias [N]
+//   cmdFy = per-active-EDF lateral force bias [N]
+//   cmdMz = per-active-EDF yaw-pair force bias [N], NOT a calibrated N*m moment.
+// For a true physical body wrench, use a geometric allocator before sending
+// individual EDF forces through PROP_COMMAND.
+volatile float cmdFx = 0.0f;
+volatile float cmdFy = 0.0f;
+volatile float cmdMz = 0.0f;
 
-volatile bool propCtrlEnabled = false;  // lateral wrench from ROS/ESP-NOW enabled
+volatile bool propCtrlEnabled = false;  // WRC force-bias control enabled
 volatile bool yawCtlEnabled   = false;  // IMU-based yaw hold enabled
 volatile bool manualThrusterMode = false; // true for THR / tN / pth bench commands until timeout
+
+// Direct T1..T4 force mode driven by PROP_COMMAND at cyclic ROS rate.
+// It overrides WRC allocation on lateral thrusters but can still coexist with
+// the dedicated T5/T6 pitch hold.
+volatile bool directLateralForceMode = false;
+volatile float directT1ForceN = 0.0f;
+volatile float directT2ForceN = 0.0f;
+volatile float directT3ForceN = 0.0f;
+volatile float directT4ForceN = 0.0f;
 
 // Final thruster configuration (already agreed with wiring):
 // T1 = Y1 = CW   , Pack A
@@ -293,9 +431,12 @@ volatile bool manualThrusterMode = false; // true for THR / tN / pth bench comma
 static constexpr float FX_GAIN = 1.0f;
 static constexpr float FY_GAIN = 1.0f;
 static constexpr float MZ_GAIN = 1.0f;
-static constexpr float THR_MAX = 1.0f;
-static constexpr float PITCH_MIN_ACTIVE = 0.80f;
-static constexpr float YAW_MIN_ACTIVE   = 0.60f;
+
+// Internal PID thresholds remain normalised to preserve the existing tuning.
+// External/manual/high-level commands are expressed in newtons and converted
+// through forceToThrottle().
+static constexpr float PITCH_MIN_ACTIVE = 0.80f;  // 9.610 N on datasheet map
+static constexpr float YAW_MIN_ACTIVE   = 0.60f;  // 6.180 N on datasheet map
 
 static constexpr float PITCH_RAMP_STEP   = 0.10f;
 static constexpr float LATERAL_RAMP_STEP = 0.08f;
@@ -312,7 +453,7 @@ volatile float pitchRefRad     = 0.0f;
 volatile float pitchKp         = 1.2f;
 volatile float pitchKi         = 0.0f;
 volatile float pitchKd         = 0.05f;
-volatile float pitchUmax       = 0.6f;
+volatile float pitchUmax       = 1.0f;  // 14.030 N on datasheet map
 volatile float pitchDeadDeg    = 2.0f;   // "dritto" band
 volatile float pitchSafeDeg    = 45.0f;
 static float pitchPidI         = 0.0f;
@@ -322,7 +463,7 @@ static float pitchPrevE        = 0.0f;
 volatile float yawRefRad       = 0.0f;
 volatile float yawKp           = 0.9f;
 volatile float yawKd           = 0.04f;
-volatile float yawUmax         = 0.45f;
+volatile float yawUmax         = 0.60f; // 6.180 N on datasheet map
 volatile float yawDeadDeg      = 3.0f;
 
 // Yaw robusto contro drift lento IMU
@@ -416,34 +557,32 @@ bool readLine(String& out) {
 void printHelp() {
   Serial.println(F(
     "Commands:\n"
-    "  s1 <deg>                 - set valve1 angle (0..90)\n"
-    "  s2 <deg>                 - set valve2 angle (0..90)\n"
-    "  THR,t1,t2,t3,t4,t5,t6    - set all thrusters duty\n"
-    "  t1 <val> ... t6 <val>    - set one thruster duty without changing the others\n"
-    "  pth <val>                - manual pitch thrusters command in [-1..1]\n"
-    "  pitch                    - print current pitch angle\n"
-    "  yaw                      - print current yaw angle\n"
-    "  apon / apoff             - enable/disable onboard pitch hold\n"
-    "  ayon / ayoff             - enable/disable onboard yaw hold\n"
-    "  atton / attoff           - enable/disable both pitch+yaw hold\n"
-    "  apzero / ayzero          - set current pitch/yaw as reference\n"
-    "  attzero                  - set both references to current attitude\n"
-    "  pid <Kp> <Ki> <Kd>       - set pitch controller gains\n"
-    "  ypid <Kp> <Kd>           - set yaw controller gains\n"
-    "  umax <0..1>              - set max pitch thruster command\n"
-    "  yumax <0..1>             - set max yaw thruster command\n"
-    "  pdb <deg> / ydb <deg>    - set pitch/yaw deadbands in degrees\n"
-    "  m<val>                   - motor command in [-1..1]\n"
-    "  mf <hz>                  - set motor PWM frequency\n"
-    "  mstop                    - stop motor\n"
-    "  WRC,fx,fy,mz             - set lateral wrench command (open-loop bias)\n"
-    "  pron / proff             - enable/disable lateral high-level wrench\n"
-    "  ext                      - test motor extend\n"
-    "  ret                      - test motor retract\n"
-    "  status                   - print current state\n"
-    "  arm / disarm             - send min throttle / stop all ESCs\n"
-    "  stop                     - stop all thrusters\n"
-    "  help                     - show this help\n"
+    "  s1 <deg>                         - set valve1 angle (0..90)\n"
+    "  s2 <deg>                         - set valve2 angle (0..90)\n"
+    "  THR,f1,f2,f3,f4,f5,f6           - set all EDF forces [N]\n"
+    "  t1 <N> ... t6 <N>               - set one EDF force [N]\n"
+    "  pth <signed_N>                   - manual pitch force: +T5 / -T6\n"
+    "  PROP_COMMAND,f1,f2,f3,f4        - set T1..T4 forces [N] from ROS\n"
+    "  WRC,fxN,fyN,yawPairN            - temporary per-EDF force-bias mixer [N]\n"
+    "  pitch / yaw                     - print current attitude angle\n"
+    "  apon / apoff                    - enable/disable onboard pitch hold\n"
+    "  ayon / ayoff                    - enable/disable onboard yaw hold\n"
+    "  atton / attoff                  - enable/disable both pitch+yaw hold\n"
+    "  apzero / ayzero / attzero       - set attitude references\n"
+    "  pid <Kp> <Ki> <Kd>              - set pitch PID gains (internal normalised PID)\n"
+    "  ypid <Kp> <Kd>                  - set yaw PID gains (internal normalised PID)\n"
+    "  umax <N>                        - set maximum pitch force per active EDF\n"
+    "  yumax <N>                       - set maximum yaw force per active EDF\n"
+    "  pdb <deg> / ydb <deg>           - set pitch/yaw deadbands\n"
+    "  m<val>                          - motor command in [-1..1]\n"
+    "  mf <hz>                         - set motor PWM frequency\n"
+    "  mstop                           - stop motor\n"
+    "  pron / proff                    - enable/disable lateral force-bias control\n"
+    "  ext / ret                       - test motor extend/retract\n"
+    "  status                          - print state, force, throttle and PWM\n"
+    "  arm / disarm                    - arm / force minimum throttle\n"
+    "  stop                            - stop all thrusters\n"
+    "  help                            - show this help\n"
   ));
 }
 
@@ -489,7 +628,6 @@ bool ensureEspNowHealthy();
 
 
 
-static inline float clampf(float x, float a, float b) { return x < a ? a : (x > b ? b : x); }
 static inline float wrapPi(float a) {
   while (a >  3.1415926f) a -= 2.0f * 3.1415926f;
   while (a < -3.1415926f) a += 2.0f * 3.1415926f;
@@ -631,6 +769,8 @@ static inline bool isManualThrusterActive(uint32_t now = millis()) {
 
 static inline void enterManualThrusterMode() {
   manualThrusterMode = true;
+  directLateralForceMode = false;
+  directT1ForceN = directT2ForceN = directT3ForceN = directT4ForceN = 0.0f;
   propCtrlEnabled = false;
   yawCtlEnabled = false;
   pitchCtlEnabled = false;
@@ -641,36 +781,49 @@ static inline void enterManualThrusterMode() {
   lastThrCmdMs = millis();
 }
 
-static inline void setPitchThrustersDirect(float pitchCmd) {
-  pitchCmd = clampf(pitchCmd, -1.0f, 1.0f);
+static inline void setPitchThrustersDirect(float signedForceN) {
+  signedForceN = clampf(signedForceN, -THRUST_MAX_FORCE_N, THRUST_MAX_FORCE_N);
 
-  float t5 = 0.0f;
-  float t6 = 0.0f;
+  const float topForceN = signedForceN > 0.0f ? signedForceN : 0.0f;
+  const float botForceN = signedForceN < 0.0f ? -signedForceN : 0.0f;
 
-  if (pitchCmd > 0.0f) {
-    t5 = pitchCmd;
-  } else if (pitchCmd < 0.0f) {
-    t6 = -pitchCmd;
-  }
+  thr5.setForceN(topForceN);
+  thr6.setForceN(botForceN);
 
-  pitchTopCmd = t5;
-  pitchBotCmd = t6;
-
-  thr5.setThrottle(t5);
-  thr6.setThrottle(t6);
+  pitchTopCmd = thr5.lastThrottle();
+  pitchBotCmd = thr6.lastThrottle();
 }
 
-static inline bool setSingleThrusterManual(uint8_t number, float throttle) {
-  throttle = clampf(throttle, 0.0f, 1.0f);
+static inline bool setSingleThrusterManual(uint8_t number, float forceN) {
+  forceN = clampf(forceN, 0.0f, THRUST_MAX_FORCE_N);
 
   switch (number) {
-    case 1: latCmd1 = throttle; thr1.setThrottle(throttle); break;
-    case 2: latCmd2 = throttle; thr2.setThrottle(throttle); break;
-    case 3: latCmd3 = throttle; thr3.setThrottle(throttle); break;
-    case 4: latCmd4 = throttle; thr4.setThrottle(throttle); break;
-    case 5: thr5.setThrottle(throttle); pitchTopCmd = throttle; break;
-    case 6: thr6.setThrottle(throttle); pitchBotCmd = throttle; break;
-    default: return false;
+    case 1:
+      thr1.setForceN(forceN);
+      latCmd1 = thr1.lastThrottle();
+      break;
+    case 2:
+      thr2.setForceN(forceN);
+      latCmd2 = thr2.lastThrottle();
+      break;
+    case 3:
+      thr3.setForceN(forceN);
+      latCmd3 = thr3.lastThrottle();
+      break;
+    case 4:
+      thr4.setForceN(forceN);
+      latCmd4 = thr4.lastThrottle();
+      break;
+    case 5:
+      thr5.setForceN(forceN);
+      pitchTopCmd = thr5.lastThrottle();
+      break;
+    case 6:
+      thr6.setForceN(forceN);
+      pitchBotCmd = thr6.lastThrottle();
+      break;
+    default:
+      return false;
   }
 
   return true;
@@ -709,43 +862,41 @@ static inline float pitchActiveTarget(float x) {
 static inline void setPitchThrusters(float pitchCmd) {
   pitchCmd = clampf(pitchCmd, -1.0f, 1.0f);
 
-  float t5_target = 0.0f;
-  float t6_target = 0.0f;
+  const float maxPitch = clampf(pitchUmax, 0.0f, 1.0f);
+  const float minPitch = clampf(PITCH_MIN_ACTIVE, 0.0f, maxPitch);
+
+  float t5Target = 0.0f;
+  float t6Target = 0.0f;
 
   if (pitchCmd > 0.0f) {
-    t5_target = pitchActiveTarget(pitchCmd);
+    t5Target = pitchActiveTarget(pitchCmd);
   } else if (pitchCmd < 0.0f) {
-    t6_target = pitchActiveTarget(-pitchCmd);
+    t6Target = pitchActiveTarget(-pitchCmd);
   }
 
-  // T5 active
-  if (t5_target > 0.0f) {
+  if (t5Target > 0.0f) {
     pitchBotCmd = 0.0f;
 
-    if (pitchTopCmd < PITCH_MIN_ACTIVE) {
-      pitchTopCmd = PITCH_MIN_ACTIVE;   // parte subito da 0.8
+    if (pitchTopCmd < minPitch) {
+      pitchTopCmd = minPitch;
     } else {
-      pitchTopCmd = rampTowards(pitchTopCmd, t5_target, PITCH_RAMP_STEP);
+      pitchTopCmd = rampTowards(pitchTopCmd, t5Target, PITCH_RAMP_STEP);
     }
 
-    pitchTopCmd = clampf(pitchTopCmd, PITCH_MIN_ACTIVE, pitchUmax);
-  }
+    pitchTopCmd = clampf(pitchTopCmd, minPitch, maxPitch);
 
-  // T6 active
-  else if (t6_target > 0.0f) {
+  } else if (t6Target > 0.0f) {
     pitchTopCmd = 0.0f;
 
-    if (pitchBotCmd < PITCH_MIN_ACTIVE) {
-      pitchBotCmd = PITCH_MIN_ACTIVE;   // parte subito da 0.8
+    if (pitchBotCmd < minPitch) {
+      pitchBotCmd = minPitch;
     } else {
-      pitchBotCmd = rampTowards(pitchBotCmd, t6_target, PITCH_RAMP_STEP);
+      pitchBotCmd = rampTowards(pitchBotCmd, t6Target, PITCH_RAMP_STEP);
     }
 
-    pitchBotCmd = clampf(pitchBotCmd, PITCH_MIN_ACTIVE, pitchUmax);
-  }
+    pitchBotCmd = clampf(pitchBotCmd, minPitch, maxPitch);
 
-  // dentro deadband: spento
-  else {
+  } else {
     pitchTopCmd = 0.0f;
     pitchBotCmd = 0.0f;
   }
@@ -754,57 +905,64 @@ static inline void setPitchThrusters(float pitchCmd) {
   thr6.setThrottle(pitchBotCmd);
 }
 
-static inline void setLateralThrustersFromWrench(float fx, float fy, float mz) {
-  fx = clampf(fx, -1.0f, 1.0f);
-  fy = clampf(fy, -1.0f, 1.0f);
-  mz = clampf(mz, -1.0f, 1.0f);
+static inline void setLateralThrustersFromWrench(
+    float fxForceN,
+    float fyForceN,
+    float yawPairForceN) {
 
-  float t1 = 0.0f;
-  float t2 = 0.0f;
-  float t3 = 0.0f;
-  float t4 = 0.0f;
+  fxForceN = clampf(fxForceN, -THRUST_MAX_FORCE_N, THRUST_MAX_FORCE_N);
+  fyForceN = clampf(fyForceN, -THRUST_MAX_FORCE_N, THRUST_MAX_FORCE_N);
+  yawPairForceN = clampf(yawPairForceN, -THRUST_MAX_FORCE_N, THRUST_MAX_FORCE_N);
 
-  // Yaw allocation according to agreed propeller pairs:
-  // -Mz => right => T1 + T3
-  // +Mz => left  => T2 + T4
-  if (mz > 0.0f) {
-    t1 += MZ_GAIN * mz;
-    t3 += MZ_GAIN * mz;
-  } else if (mz < 0.0f) {
-    t2 += MZ_GAIN * (-mz);
-    t4 += MZ_GAIN * (-mz);
+  float f1 = 0.0f;
+  float f2 = 0.0f;
+  float f3 = 0.0f;
+  float f4 = 0.0f;
+
+  // Temporary force allocation. Inputs are per-active-EDF thrust requests [N].
+  // This is not yet a calibrated body-wrench allocator.
+  if (yawPairForceN > 0.0f) {
+    f1 += MZ_GAIN * yawPairForceN;
+    f3 += MZ_GAIN * yawPairForceN;
+  } else if (yawPairForceN < 0.0f) {
+    f2 += MZ_GAIN * (-yawPairForceN);
+    f4 += MZ_GAIN * (-yawPairForceN);
   }
 
-  // Tangential motion on the wall (keep as config-driven bias, tune after real mounting)
-   // Lateral translation on the wall:
-  // -Fy => left  => T1 + T2
-  // +Fy => right => T3 + T4
-  if (fy > 0.0f) {
-    t1 += FY_GAIN * fy;
-    t2 += FY_GAIN * fy;
-  } else if (fy < 0.0f) {
-    t3 += FY_GAIN * (-fy);
-    t4 += FY_GAIN * (-fy);
+  // +Fy => T1 + T2, -Fy => T3 + T4.
+  if (fyForceN > 0.0f) {
+    f1 += FY_GAIN * fyForceN;
+    f2 += FY_GAIN * fyForceN;
+  } else if (fyForceN < 0.0f) {
+    f3 += FY_GAIN * (-fyForceN);
+    f4 += FY_GAIN * (-fyForceN);
   }
 
-  // Normal push/pull bias (placeholder until full geometry allocation is identified)
-  if (fx > 0.0f) {
-    t1 += FX_GAIN * fx;
-    t4 += FX_GAIN * fx;
-  } else if (fx < 0.0f) {
-    t2 += FX_GAIN * (-fx);
-    t3 += FX_GAIN * (-fx);
+  // +Fx => T1 + T4, -Fx => T2 + T3.
+  if (fxForceN > 0.0f) {
+    f1 += FX_GAIN * fxForceN;
+    f4 += FX_GAIN * fxForceN;
+  } else if (fxForceN < 0.0f) {
+    f2 += FX_GAIN * (-fxForceN);
+    f3 += FX_GAIN * (-fxForceN);
   }
 
-  t1 = clampf(t1, 0.0f, THR_MAX);
-  t2 = clampf(t2, 0.0f, THR_MAX);
-  t3 = clampf(t3, 0.0f, THR_MAX);
-  t4 = clampf(t4, 0.0f, THR_MAX);
+  f1 = clampf(f1, 0.0f, THRUST_MAX_FORCE_N);
+  f2 = clampf(f2, 0.0f, THRUST_MAX_FORCE_N);
+  f3 = clampf(f3, 0.0f, THRUST_MAX_FORCE_N);
+  f4 = clampf(f4, 0.0f, THRUST_MAX_FORCE_N);
 
-  latCmd1 = rampTowards(latCmd1, t1, LATERAL_RAMP_STEP);
-  latCmd2 = rampTowards(latCmd2, t2, LATERAL_RAMP_STEP);
-  latCmd3 = rampTowards(latCmd3, t3, LATERAL_RAMP_STEP);
-  latCmd4 = rampTowards(latCmd4, t4, LATERAL_RAMP_STEP);
+  // Convert the force targets to the original internal throttle representation
+  // so the existing smooth ramp remains unchanged.
+  const float t1Target = forceToThrottle(f1);
+  const float t2Target = forceToThrottle(f2);
+  const float t3Target = forceToThrottle(f3);
+  const float t4Target = forceToThrottle(f4);
+
+  latCmd1 = rampTowards(latCmd1, t1Target, LATERAL_RAMP_STEP);
+  latCmd2 = rampTowards(latCmd2, t2Target, LATERAL_RAMP_STEP);
+  latCmd3 = rampTowards(latCmd3, t3Target, LATERAL_RAMP_STEP);
+  latCmd4 = rampTowards(latCmd4, t4Target, LATERAL_RAMP_STEP);
 
   thr1.setThrottle(latCmd1);
   thr2.setThrottle(latCmd2);
@@ -954,7 +1112,12 @@ void loop() {
     cmdFy = 0.0f;
     cmdMz = 0.0f;
 
-    if (!yawCtlEnabled && !propCtrlEnabled) {
+    if (directLateralForceMode) {
+      directLateralForceMode = false;
+      directT1ForceN = directT2ForceN = directT3ForceN = directT4ForceN = 0.0f;
+    }
+
+    if (!yawCtlEnabled && !propCtrlEnabled && !directLateralForceMode) {
       stopLateralThrusters();
     }
     if (!pitchCtlEnabled) {
@@ -1051,107 +1214,185 @@ void handleCommandLine(const String& in) {
     Serial.printf("Valve2 -> %.1f deg\n", v);
 
   } else if (low.startsWith("thr,")) {
-    float t1, t2, t3, t4, t5, t6;
-    int matched = sscanf(cmd.c_str(), "THR,%f,%f,%f,%f,%f,%f", &t1, &t2, &t3, &t4, &t5, &t6);
+    float f1, f2, f3, f4, f5, f6;
+    int matched = sscanf(
+      cmd.c_str(),
+      "THR,%f,%f,%f,%f,%f,%f",
+      &f1, &f2, &f3, &f4, &f5, &f6
+    );
     if (matched != 6) {
-      matched = sscanf(cmd.c_str(), "thr,%f,%f,%f,%f,%f,%f", &t1, &t2, &t3, &t4, &t5, &t6);
+      matched = sscanf(
+        cmd.c_str(),
+        "thr,%f,%f,%f,%f,%f,%f",
+        &f1, &f2, &f3, &f4, &f5, &f6
+      );
     }
 
     if (matched == 6) {
-      // Full manual thruster mode for bench testing.
-      // The 100 Hz task will not overwrite these outputs until THR_TIMEOUT_MS expires.
       enterManualThrusterMode();
 
-      t1 = clampf(t1, 0.0f, 1.0f);
-      t2 = clampf(t2, 0.0f, 1.0f);
-      t3 = clampf(t3, 0.0f, 1.0f);
-      t4 = clampf(t4, 0.0f, 1.0f);
-      t5 = clampf(t5, 0.0f, 1.0f);
-      t6 = clampf(t6, 0.0f, 1.0f);
+      f1 = clampf(f1, 0.0f, THRUST_MAX_FORCE_N);
+      f2 = clampf(f2, 0.0f, THRUST_MAX_FORCE_N);
+      f3 = clampf(f3, 0.0f, THRUST_MAX_FORCE_N);
+      f4 = clampf(f4, 0.0f, THRUST_MAX_FORCE_N);
+      f5 = clampf(f5, 0.0f, THRUST_MAX_FORCE_N);
+      f6 = clampf(f6, 0.0f, THRUST_MAX_FORCE_N);
 
-      latCmd1 = t1;
-      latCmd2 = t2;
-      latCmd3 = t3;
-      latCmd4 = t4;
-      pitchTopCmd = t5;
-      pitchBotCmd = t6;
+      thr1.setForceN(f1);
+      thr2.setForceN(f2);
+      thr3.setForceN(f3);
+      thr4.setForceN(f4);
+      thr5.setForceN(f5);
+      thr6.setForceN(f6);
 
-      thr1.setThrottle(t1);
-      thr2.setThrottle(t2);
-      thr3.setThrottle(t3);
-      thr4.setThrottle(t4);
-      thr5.setThrottle(t5);
-      thr6.setThrottle(t6);
+      latCmd1 = thr1.lastThrottle();
+      latCmd2 = thr2.lastThrottle();
+      latCmd3 = thr3.lastThrottle();
+      latCmd4 = thr4.lastThrottle();
+      pitchTopCmd = thr5.lastThrottle();
+      pitchBotCmd = thr6.lastThrottle();
 
-      Serial.printf("THR -> %.2f %.2f %.2f %.2f %.2f %.2f, manual timeout=%lu ms\n",
-                    t1, t2, t3, t4, t5, t6, (unsigned long)MANUAL_THR_TIMEOUT_MS);
+      Serial.printf(
+        "THR FORCE -> %.3f %.3f %.3f %.3f %.3f %.3f N, manual timeout=%lu ms\n",
+        f1, f2, f3, f4, f5, f6,
+        (unsigned long)MANUAL_THR_TIMEOUT_MS
+      );
     } else {
-      Serial.println("ERR: usage THR,t1,t2,t3,t4,t5,t6");
+      Serial.println("ERR: usage THR,f1_n,f2_n,f3_n,f4_n,f5_n,f6_n");
     }
 
   } else if (low.startsWith("t")) {
     char commandLetter = 0;
     int thrusterNumber = 0;
-    float throttle = 0.0f;
+    float forceN = 0.0f;
 
-    int itemsRead = sscanf(cmd.c_str(), "%c%d %f", &commandLetter, &thrusterNumber, &throttle);
+    int itemsRead = sscanf(cmd.c_str(), "%c%d %f", &commandLetter, &thrusterNumber, &forceN);
     if (itemsRead != 3) {
-      itemsRead = sscanf(cmd.c_str(), "%c%d,%f", &commandLetter, &thrusterNumber, &throttle);
+      itemsRead = sscanf(cmd.c_str(), "%c%d,%f", &commandLetter, &thrusterNumber, &forceN);
     }
 
     if (itemsRead == 3 && (commandLetter == 't' || commandLetter == 'T')) {
       enterManualThrusterMode();
-      if (setSingleThrusterManual((uint8_t)thrusterNumber, throttle)) {
+      if (setSingleThrusterManual((uint8_t)thrusterNumber, forceN)) {
         lastThrCmdMs = millis();
-        Serial.printf("T%d -> %.2f, manual timeout=%lu ms\n",
-                      thrusterNumber,
-                      clampf(throttle, 0.0f, 1.0f),
-                      (unsigned long)MANUAL_THR_TIMEOUT_MS);
+        Serial.printf(
+          "T%d -> %.3f N (throttle %.3f), manual timeout=%lu ms\n",
+          thrusterNumber,
+          clampf(forceN, 0.0f, THRUST_MAX_FORCE_N),
+          forceToThrottle(forceN),
+          (unsigned long)MANUAL_THR_TIMEOUT_MS
+        );
       } else {
-        Serial.println("ERR: use t1..t6, example: t1 0.3");
+        Serial.println("ERR: use t1..t6, example: t1 6.0");
       }
     } else {
-      Serial.println("ERR: usage t1 0.3");
+      Serial.println("ERR: usage t1 6.0");
     }
 
   } else if (low.startsWith("pth ")) {
-  float u = 0.0f;
-  int n = sscanf(cmd.c_str(), "pth %f", &u);
+  float forceN = 0.0f;
+  int n = sscanf(cmd.c_str(), "pth %f", &forceN);
   if (n == 1) {
     enterManualThrusterMode();
     stopLateralThrusters();
-    setPitchThrustersDirect(u);
+    setPitchThrustersDirect(forceN);
     lastThrCmdMs = millis();
-    Serial.printf("Pitch thrusters -> %.2f, manual timeout=%lu ms\n",
-                  clampf(u, -1.0f, 1.0f), (unsigned long)MANUAL_THR_TIMEOUT_MS);
+    Serial.printf(
+      "Pitch force -> %.3f N (+T5 / -T6), manual timeout=%lu ms\n",
+      clampf(forceN, -THRUST_MAX_FORCE_N, THRUST_MAX_FORCE_N),
+      (unsigned long)MANUAL_THR_TIMEOUT_MS
+    );
   } else {
-    Serial.println("Usage: pth <-1..1>");
+    Serial.println("Usage: pth <signed force N>");
+  }
+
+  } else if (low.startsWith("prop_command,")) {
+  float f1, f2, f3, f4;
+  int matched = sscanf(
+    cmd.c_str(),
+    "PROP_COMMAND,%f,%f,%f,%f",
+    &f1, &f2, &f3, &f4
+  );
+  if (matched != 4) {
+    matched = sscanf(
+      cmd.c_str(),
+      "prop_command,%f,%f,%f,%f",
+      &f1, &f2, &f3, &f4
+    );
+  }
+
+  if (matched == 4) {
+    manualThrusterMode = false;
+    directLateralForceMode = true;
+    propCtrlEnabled = false;
+    lastThrCmdMs = millis();
+
+    directT1ForceN = clampf(f1, 0.0f, THRUST_MAX_FORCE_N);
+    directT2ForceN = clampf(f2, 0.0f, THRUST_MAX_FORCE_N);
+    directT3ForceN = clampf(f3, 0.0f, THRUST_MAX_FORCE_N);
+    directT4ForceN = clampf(f4, 0.0f, THRUST_MAX_FORCE_N);
+
+    // Apply immediately; the 100 Hz task will keep refreshing these values.
+    thr1.setForceN(directT1ForceN);
+    thr2.setForceN(directT2ForceN);
+    thr3.setForceN(directT3ForceN);
+    thr4.setForceN(directT4ForceN);
+
+    latCmd1 = thr1.lastThrottle();
+    latCmd2 = thr2.lastThrottle();
+    latCmd3 = thr3.lastThrottle();
+    latCmd4 = thr4.lastThrottle();
+
+    Serial.printf(
+      "PROP FORCE -> %.3f %.3f %.3f %.3f N\n",
+      directT1ForceN,
+      directT2ForceN,
+      directT3ForceN,
+      directT4ForceN
+    );
+  } else {
+    Serial.println("ERR: usage PROP_COMMAND,f1_n,f2_n,f3_n,f4_n");
   }
 
   } else if (low.startsWith("wrc,")) {
-  float fx, fy, mz;
-  int matched = sscanf(cmd.c_str(), "WRC,%f,%f,%f", &fx, &fy, &mz);
+  float fxForceN, fyForceN, yawPairForceN;
+  int matched = sscanf(
+    cmd.c_str(),
+    "WRC,%f,%f,%f",
+    &fxForceN, &fyForceN, &yawPairForceN
+  );
   if (matched != 3) {
-    matched = sscanf(cmd.c_str(), "wrc,%f,%f,%f", &fx, &fy, &mz);
+    matched = sscanf(
+      cmd.c_str(),
+      "wrc,%f,%f,%f",
+      &fxForceN, &fyForceN, &yawPairForceN
+    );
   }
 
   if (matched == 3) {
     manualThrusterMode = false;
+    directLateralForceMode = false;
+    directT1ForceN = directT2ForceN = directT3ForceN = directT4ForceN = 0.0f;
     propCtrlEnabled = true;
-    cmdFx = clampf(fx, -1.0f, 1.0f);
-    cmdFy = clampf(fy, -1.0f, 1.0f);
-    cmdMz = clampf(mz, -1.0f, 1.0f);
+    cmdFx = clampf(fxForceN, -THRUST_MAX_FORCE_N, THRUST_MAX_FORCE_N);
+    cmdFy = clampf(fyForceN, -THRUST_MAX_FORCE_N, THRUST_MAX_FORCE_N);
+    cmdMz = clampf(yawPairForceN, -THRUST_MAX_FORCE_N, THRUST_MAX_FORCE_N);
     lastThrCmdMs = millis();
 
     setLateralThrustersFromWrench(cmdFx, cmdFy, cmdMz);
 
-    Serial.printf("WRC -> Fx=%.2f Fy=%.2f Mz=%.2f\n", cmdFx, cmdFy, cmdMz);
+    Serial.printf(
+      "WRC FORCE BIAS -> Fx=%.3f N Fy=%.3f N yawPair=%.3f N\n",
+      cmdFx, cmdFy, cmdMz
+    );
   } else {
-    Serial.println("ERR: usage WRC,fx,fy,mz");
+    Serial.println("ERR: usage WRC,fx_n,fy_n,yaw_pair_force_n");
   }
 
 } else if (low == "stop") {
     manualThrusterMode = false;
+    directLateralForceMode = false;
+    directT1ForceN = directT2ForceN = directT3ForceN = directT4ForceN = 0.0f;
     pitchCtlEnabled = false;
     yawCtlEnabled = false;
     propCtrlEnabled = false;
@@ -1237,6 +1478,8 @@ void handleCommandLine(const String& in) {
 
   } else if (low == "attoff") {
     manualThrusterMode = false;
+    directLateralForceMode = false;
+    directT1ForceN = directT2ForceN = directT3ForceN = directT4ForceN = 0.0f;
     pitchCtlEnabled = false;
     yawCtlEnabled = false;
     assistEnabled = false;
@@ -1245,10 +1488,14 @@ void handleCommandLine(const String& in) {
 
   } else if (low == "pron") {
   manualThrusterMode = false;
+  directLateralForceMode = false;
+  directT1ForceN = directT2ForceN = directT3ForceN = directT4ForceN = 0.0f;
   propCtrlEnabled = true;
-  Serial.println("Lateral prop control ON");
+  Serial.println("Lateral WRC force-bias control ON");
 } else if (low == "proff") {
   manualThrusterMode = false;
+  directLateralForceMode = false;
+  directT1ForceN = directT2ForceN = directT3ForceN = directT4ForceN = 0.0f;
   propCtrlEnabled = false;
   cmdFx = 0.0f;
   cmdFy = 0.0f;
@@ -1299,13 +1546,17 @@ void handleCommandLine(const String& in) {
     }
 
   } else if (low.startsWith("umax ")) {
-    float x;
-    int n = sscanf(cmd.c_str(), "umax %f", &x);
+    float forceN;
+    int n = sscanf(cmd.c_str(), "umax %f", &forceN);
     if (n == 1) {
-      pitchUmax = clampf(x, 0.0f, 1.0f);
-      Serial.printf("Pitch uMax=%.2f\n", pitchUmax);
+      forceN = clampf(forceN, 0.0f, THRUST_MAX_FORCE_N);
+      pitchUmax = forceToThrottle(forceN);
+      Serial.printf(
+        "Pitch max force=%.3f N -> uMax=%.3f\n",
+        forceN, pitchUmax
+      );
     } else {
-      Serial.println("Usage: umax <0..1>");
+      Serial.println("Usage: umax <force N>");
     }
 
   } else if (low.startsWith("ypid ")) {
@@ -1320,13 +1571,17 @@ void handleCommandLine(const String& in) {
     }
 
   } else if (low.startsWith("yumax ")) {
-    float x;
-    int n = sscanf(cmd.c_str(), "yumax %f", &x);
+    float forceN;
+    int n = sscanf(cmd.c_str(), "yumax %f", &forceN);
     if (n == 1) {
-      yawUmax = clampf(x, 0.0f, 1.0f);
-      Serial.printf("Yaw uMax=%.2f\n", yawUmax);
+      forceN = clampf(forceN, 0.0f, THRUST_MAX_FORCE_N);
+      yawUmax = forceToThrottle(forceN);
+      Serial.printf(
+        "Yaw max force=%.3f N -> uMax=%.3f\n",
+        forceN, yawUmax
+      );
     } else {
-      Serial.println("Usage: yumax <0..1>");
+      Serial.println("Usage: yumax <force N>");
     }
 
   } else if (low.startsWith("pdb ")) {
@@ -1384,22 +1639,69 @@ void handleCommandLine(const String& in) {
   } else if (low == "status") {
   Serial.println("--- STATUS ---");
   Serial.printf("Motor duty cmd: %.3f\n", motor.lastCommand());
-  Serial.printf("cmdFx=%.2f cmdFy=%.2f cmdMz=%.2f manualThr=%d manualActive=%d\n",
-                cmdFx, cmdFy, cmdMz, (int)manualThrusterMode, (int)isManualThrusterActive());
-  Serial.printf("THR_TIMEOUT_MS=%lu MANUAL_THR_TIMEOUT_MS=%lu\n",
-                (unsigned long)THR_TIMEOUT_MS, (unsigned long)MANUAL_THR_TIMEOUT_MS);
-  Serial.printf("pitchCtl=%d yawCtl=%d propCtrl=%d pitchRef=%.2fdeg yawRef=%.2fdeg pDead=%.2f yDead=%.2f\n",
-                (int)pitchCtlEnabled, (int)yawCtlEnabled, (int)propCtrlEnabled,
-                pitchRefRad * 180.0f / 3.1415926f, yawRefRad * 180.0f / 3.1415926f,
-                pitchDeadDeg, yawDeadDeg);
-  Serial.printf("lastPitchCmd=%.2f lastYawCmd=%.2f\n", lastPitchCmd, lastYawCmd);
-  Serial.printf("T1=%.2f T2=%.2f T3=%.2f T4=%.2f T5=%.2f T6=%.2f\n",
-    thr1.lastThrottle(), thr2.lastThrottle(), thr3.lastThrottle(),
-    thr4.lastThrottle(), thr5.lastThrottle(), thr6.lastThrottle());
-  Serial.printf("T_us: %d %d %d %d %d %d\n",
-    thr1.lastPulseUs(), thr2.lastPulseUs(), thr3.lastPulseUs(),
-    thr4.lastPulseUs(), thr5.lastPulseUs(), thr6.lastPulseUs());
-    
+  Serial.printf(
+    "cmdFx=%.3fN cmdFy=%.3fN cmdYawPair=%.3fN manualThr=%d manualActive=%d directForce=%d\n",
+    cmdFx, cmdFy, cmdMz,
+    (int)manualThrusterMode,
+    (int)isManualThrusterActive(),
+    (int)directLateralForceMode
+  );
+  Serial.printf(
+    "direct_T1..T4_N: %.3f %.3f %.3f %.3f\n",
+    directT1ForceN,
+    directT2ForceN,
+    directT3ForceN,
+    directT4ForceN
+  );
+  Serial.printf(
+    "THR_TIMEOUT_MS=%lu MANUAL_THR_TIMEOUT_MS=%lu\n",
+    (unsigned long)THR_TIMEOUT_MS,
+    (unsigned long)MANUAL_THR_TIMEOUT_MS
+  );
+  Serial.printf(
+    "pitchCtl=%d yawCtl=%d propCtrl=%d pitchRef=%.2fdeg yawRef=%.2fdeg pDead=%.2f yDead=%.2f\n",
+    (int)pitchCtlEnabled,
+    (int)yawCtlEnabled,
+    (int)propCtrlEnabled,
+    pitchRefRad * 180.0f / 3.1415926f,
+    yawRefRad * 180.0f / 3.1415926f,
+    pitchDeadDeg,
+    yawDeadDeg
+  );
+  Serial.printf(
+    "pitchMax=%.3fN yawMax=%.3fN lastPitchCmd=%.3f lastYawCmd=%.3f\n",
+    pitchUmax <= 0.0f ? 0.0f : throttleToForce(pitchUmax),
+    yawUmax <= 0.0f ? 0.0f : throttleToForce(yawUmax),
+    lastPitchCmd,
+    lastYawCmd
+  );
+  Serial.printf(
+    "T_force_N: %.3f %.3f %.3f %.3f %.3f %.3f\n",
+    thr1.lastForceN(),
+    thr2.lastForceN(),
+    thr3.lastForceN(),
+    thr4.lastForceN(),
+    thr5.lastForceN(),
+    thr6.lastForceN()
+  );
+  Serial.printf(
+    "T_throttle: %.3f %.3f %.3f %.3f %.3f %.3f\n",
+    thr1.lastThrottle(),
+    thr2.lastThrottle(),
+    thr3.lastThrottle(),
+    thr4.lastThrottle(),
+    thr5.lastThrottle(),
+    thr6.lastThrottle()
+  );
+  Serial.printf(
+    "T_us: %d %d %d %d %d %d\n",
+    thr1.lastPulseUs(),
+    thr2.lastPulseUs(),
+    thr3.lastPulseUs(),
+    thr4.lastPulseUs(),
+    thr5.lastPulseUs(),
+    thr6.lastPulseUs()
+  );
   Serial.printf("ESP-NOW tx_count: %lu\n", (unsigned long)EspNow_txCount());
 
   } else if (low == "arm") {
@@ -1411,6 +1713,8 @@ void handleCommandLine(const String& in) {
 
   } else if (low == "disarm") {
     manualThrusterMode = false;
+    directLateralForceMode = false;
+    directT1ForceN = directT2ForceN = directT3ForceN = directT4ForceN = 0.0f;
     pitchCtlEnabled = false;
     yawCtlEnabled = false;
     propCtrlEnabled = false;
@@ -1555,19 +1859,59 @@ void EspNowTxTask(void* arg) {
         stopPitchThrusters();
       }
 
-      // Yaw hold runs on the four lateral thrusters and adds to the high-level open-loop cmdMz.
-      float yawHoldMz = 0.0f;
-        if (yawCtlEnabled) {
-        yawHoldMz = YAW_PID_OUTPUT_SIGN * yawPidStep(yawRad, dt);
+      // Yaw hold PID remains internally normalised. Convert its output to the
+      // datasheet per-EDF force map before adding it to high-level force bias.
+      float yawHoldCmd = 0.0f;
+      if (yawCtlEnabled) {
+        yawHoldCmd = YAW_PID_OUTPUT_SIGN * yawPidStep(yawRad, dt);
       }
 
-      lastYawCmd = yawHoldMz;
+      lastYawCmd = yawHoldCmd;
 
-      const bool lateralActive = propCtrlEnabled || yawCtlEnabled;
-      if (lateralActive) {
-          setLateralThrustersFromWrench(cmdFx, cmdFy, cmdMz + yawHoldMz);
+      float yawHoldForceN = 0.0f;
+      if (yawHoldCmd > 0.0f) {
+        yawHoldForceN = throttleToForce(yawHoldCmd);
+      } else if (yawHoldCmd < 0.0f) {
+        yawHoldForceN = -throttleToForce(-yawHoldCmd);
+      }
+
+      if (directLateralForceMode) {
+        // Direct T1..T4 forces from ROS. The yaw hold, when enabled, is added
+        // as a per-EDF pair force and then clamped.
+        float f1 = directT1ForceN;
+        float f2 = directT2ForceN;
+        float f3 = directT3ForceN;
+        float f4 = directT4ForceN;
+
+        if (yawHoldForceN > 0.0f) {
+          f1 += yawHoldForceN;
+          f3 += yawHoldForceN;
+        } else if (yawHoldForceN < 0.0f) {
+          f2 += -yawHoldForceN;
+          f4 += -yawHoldForceN;
+        }
+
+        thr1.setForceN(clampf(f1, 0.0f, THRUST_MAX_FORCE_N));
+        thr2.setForceN(clampf(f2, 0.0f, THRUST_MAX_FORCE_N));
+        thr3.setForceN(clampf(f3, 0.0f, THRUST_MAX_FORCE_N));
+        thr4.setForceN(clampf(f4, 0.0f, THRUST_MAX_FORCE_N));
+
+        latCmd1 = thr1.lastThrottle();
+        latCmd2 = thr2.lastThrottle();
+        latCmd3 = thr3.lastThrottle();
+        latCmd4 = thr4.lastThrottle();
+
       } else {
-        stopLateralThrusters();
+        const bool lateralActive = propCtrlEnabled || yawCtlEnabled;
+        if (lateralActive) {
+          setLateralThrustersFromWrench(
+            cmdFx,
+            cmdFy,
+            cmdMz + yawHoldForceN
+          );
+        } else {
+          stopLateralThrusters();
+        }
       }
     }
 
