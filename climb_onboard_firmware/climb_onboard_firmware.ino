@@ -455,7 +455,7 @@ volatile float pitchKi         = 0.0f;
 volatile float pitchKd         = 0.05f;
 volatile float pitchUmax       = 1.0f;  // 14.030 N on datasheet map
 volatile float pitchDeadDeg    = 2.0f;   // "dritto" band
-volatile float pitchSafeDeg    = 45.0f;
+volatile float pitchSafeDeg    = 65.0f;
 static float pitchPidI         = 0.0f;
 static float pitchPrevE        = 0.0f;
 
